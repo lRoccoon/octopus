@@ -47,7 +47,12 @@ func (o *MessageOutbound) TransformRequest(ctx context.Context, request *model.I
 
 	// Set headers
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
+	// For streaming requests, Anthropic returns Server-Sent Events.
+	if request.Stream != nil && *request.Stream {
+		req.Header.Set("Accept", "text/event-stream")
+	} else {
+		req.Header.Set("Accept", "application/json")
+	}
 	req.Header.Set("Anthropic-Version", "2023-06-01")
 	req.Header.Set("X-API-Key", key)
 
@@ -427,12 +432,38 @@ func convertToolMessage(msg model.Message, allMessages []model.Message, processe
 		contentBlocks = append(contentBlocks, convertToolResultBlock(tm))
 	}
 
+	// Merge the associated user message content (if any) into the same Anthropic user message.
+	// In Anthropic Messages, tool_result blocks live inside a user message's content array.
+	// Our internal format represents tool results as separate "tool" role messages, but the
+	// original Anthropic request may also include additional user content alongside tool_result.
+	if userMsg := findUserMessageByIndex(allMessages, *msg.MessageIndex); userMsg != nil {
+		userContent := buildMessageContent(*userMsg)
+		if len(userContent.MultipleContent) > 0 {
+			contentBlocks = append(contentBlocks, userContent.MultipleContent...)
+		} else if userContent.Content != nil && *userContent.Content != "" {
+			contentBlocks = append(contentBlocks, anthropicModel.MessageContentBlock{
+				Type: "text",
+				Text: userContent.Content,
+			})
+		}
+	}
+
 	processedIndexes[*msg.MessageIndex] = true
 
 	return []anthropicModel.MessageParam{{
 		Role:    "user",
 		Content: anthropicModel.MessageContent{MultipleContent: contentBlocks},
 	}}
+}
+
+func findUserMessageByIndex(allMessages []model.Message, messageIndex int) *model.Message {
+	for i := range allMessages {
+		m := &allMessages[i]
+		if m.Role == "user" && m.MessageIndex != nil && *m.MessageIndex == messageIndex {
+			return m
+		}
+	}
+	return nil
 }
 
 func convertToolResultBlock(msg model.Message) anthropicModel.MessageContentBlock {
